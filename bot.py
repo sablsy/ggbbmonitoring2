@@ -1,36 +1,16 @@
 """
 Grab Daily Telegram Bot
 -----------------------
-Fetches Grab / competitor / industry news via RSS + Perplexity,
-posts to a Telegram group chat, and drafts the 12pm report.
-
-Commands:
-  /grab       - fetch latest Grab articles now
-  /comp       - fetch competitor articles now
-  /industry   - fetch industry articles now
-  /all        - fetch all three buckets now
-  /report     - draft today's 12pm Grab Daily report
-  /watchlist  - show active watchlist items
-  /watch <keyword> | <notes> | <days>  - add a watchlist item
-  /help       - show commands
-
-Schedules (Singapore time):
-  08:00, 10:00, 12:00, 15:00, 17:00, 19:00 - auto-fetch all buckets
-  12:01 - also sends draft report to group
+RSS + Perplexity news fetcher for Grab PR team.
+Posts to Telegram group. Schedules sweeps 8am-7pm SGT.
+Sends draft report at 12pm SGT.
 """
 
-import os
-import json
-import logging
-import asyncio
-import feedparser
-import httpx
-from datetime import datetime, timedelta
+import os, json, logging, asyncio, feedparser, httpx
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -39,10 +19,7 @@ GROUP_CHAT_ID  = int(os.environ["GROUP_CHAT_ID"])
 PERPLEXITY_KEY = os.environ.get("PERPLEXITY_KEY", "")
 SGT            = ZoneInfo("Asia/Singapore")
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -57,9 +34,9 @@ def load_state():
             pass
     return {"articles": [], "watchlist": [], "next_id": 1}
 
-def save_state(state):
+def save_state(s):
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(s, f, indent=2)
 
 state = load_state()
 
@@ -72,11 +49,8 @@ def add_article(headline, url, pub, bucket, urgent=False):
     if any(a["url"] == url for a in state["articles"]):
         return False
     state["articles"].append({
-        "id": state["next_id"],
-        "bucket": bucket,
-        "pub": pub,
-        "headline": headline,
-        "url": url,
+        "id": state["next_id"], "bucket": bucket, "pub": pub,
+        "headline": headline, "url": url,
         "date": datetime.now(SGT).strftime("%Y-%m-%d"),
         "urgent": urgent,
     })
@@ -118,13 +92,12 @@ async def fetch_rss():
     async with httpx.AsyncClient(timeout=15) as client:
         for feed in RSS_FEEDS:
             try:
-                resp = await client.get(feed["url"])
+                resp   = await client.get(feed["url"])
                 parsed = feedparser.parse(resp.text)
                 for entry in parsed.entries[:20]:
-                    title = entry.get("title", "").strip()
-                    link  = entry.get("link", "").strip()
-                    if not title or not link:
-                        continue
+                    title  = entry.get("title", "").strip()
+                    link   = entry.get("link", "").strip()
+                    if not title or not link: continue
                     bucket = detect_bucket(title + " " + link)
                     if bucket:
                         found.append((title, link, feed["name"], bucket))
@@ -133,38 +106,26 @@ async def fetch_rss():
     return found
 
 # ── Perplexity ────────────────────────────────────────────────────────────────
-PERP_QUERIES = {
+PERP_Q = {
     "grab": "Grab Singapore superapp news today from Straits Times CNA Business Times Mothership STOMP",
     "comp": "Foodpanda Gojek ComfortDelGro Shopee Singapore news today",
     "ind":  "Singapore LTA MRT COE transport platform workers news today",
 }
 
 async def fetch_perplexity(bucket):
-    if not PERPLEXITY_KEY:
-        return []
+    if not PERPLEXITY_KEY: return []
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 "https://api.perplexity.ai/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {PERPLEXITY_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "sonar",
-                    "messages": [{
-                        "role": "user",
-                        "content": (
-                            f"Find the latest Singapore news articles today about: {PERP_QUERIES[bucket]}. "
-                            "Return ONLY a JSON array, no other text, no markdown. "
-                            "Each item: {\"headline\": \"...\", \"url\": \"...\", \"pub\": \"publication name\"}. Max 6 items."
-                        )
-                    }],
-                }
+                headers={"Authorization": f"Bearer {PERPLEXITY_KEY}", "Content-Type": "application/json"},
+                json={"model": "sonar", "messages": [{"role": "user", "content":
+                    f"Find latest Singapore news today about: {PERP_Q[bucket]}. "
+                    "Return ONLY a JSON array, no other text. Each item: "
+                    "{\"headline\": \"...\", \"url\": \"...\", \"pub\": \"...\"} Max 6 items."}]}
             )
-            data = resp.json()
-            raw = data["choices"][0]["message"]["content"]
-            raw = raw.replace("```json", "").replace("```", "").strip()
+            raw   = resp.json()["choices"][0]["message"]["content"]
+            raw   = raw.replace("```json","").replace("```","").strip()
             items = json.loads(raw)
             return [(i["headline"], i["url"], i.get("pub","Unknown"), bucket)
                     for i in items if i.get("headline") and i.get("url")]
@@ -175,92 +136,66 @@ async def fetch_perplexity(bucket):
 # ── Core fetch ────────────────────────────────────────────────────────────────
 async def fetch_bucket(bucket):
     prune_old()
-    rss_all = await fetch_rss()
+    rss_all    = await fetch_rss()
     rss_bucket = [(h,u,p,b) for h,u,p,b in rss_all if b == bucket]
-    perp = await fetch_perplexity(bucket)
-    new_articles, urgent_articles = [], []
+    perp       = await fetch_perplexity(bucket)
+    new, urgent = [], []
     for headline, url, pub, bkt in rss_bucket + perp:
         urg = is_urgent(headline)
         if add_article(headline, url, pub, bkt, urgent=urg):
             art = state["articles"][-1]
-            new_articles.append(art)
-            if urg:
-                urgent_articles.append(art)
-    return new_articles, urgent_articles
+            new.append(art)
+            if urg: urgent.append(art)
+    return new, urgent
 
-async def fetch_all_buckets():
+async def fetch_all():
     all_new, all_urgent = [], []
-    for bucket in ["grab", "comp", "ind"]:
-        new, urgent = await fetch_bucket(bucket)
-        all_new.extend(new)
-        all_urgent.extend(urgent)
+    for b in ["grab","comp","ind"]:
+        n, u = await fetch_bucket(b)
+        all_new.extend(n); all_urgent.extend(u)
     return all_new, all_urgent
 
 # ── Formatting ────────────────────────────────────────────────────────────────
-EMOJI = {"grab": "🟢", "comp": "🟠", "ind": "🔵"}
-LABEL = {"grab": "Grab", "comp": "Competitor", "ind": "Industry"}
+EMOJI = {"grab":"🟢","comp":"🟠","ind":"🔵"}
 
-def fmt_sweep(new_articles, label):
+def fmt_sweep(new, label):
     today = datetime.now(SGT).strftime("%-d %B %Y")
-    if not new_articles:
-        return f"*{label} sweep — {today}*\nNo new articles found."
-    lines = [f"*{label} sweep — {today}*\n_{len(new_articles)} new article(s)_\n"]
-    for a in new_articles:
+    if not new: return f"*{label} sweep — {today}*\nNo new articles found."
+    lines = [f"*{label} sweep — {today}*\n_{len(new)} new article(s)_\n"]
+    for a in new:
         urg = "🚨 " if a["urgent"] else ""
         lines.append(f"{urg}{EMOJI.get(a['bucket'],'•')} [{a['headline']}]({a['url']}) — _{a['pub']}_")
     return "\n".join(lines)
 
 def fmt_report():
-    today_str = datetime.now(SGT).strftime("%Y-%m-%d")
+    today_str   = datetime.now(SGT).strftime("%Y-%m-%d")
     today_label = datetime.now(SGT).strftime("%-d %B %Y")
-    arts = [a for a in state["articles"] if a["date"] == today_str]
-    grab = [a for a in arts if a["bucket"] == "grab"]
-    comp = [a for a in arts if a["bucket"] == "comp"]
-    ind  = [a for a in arts if a["bucket"] == "ind"]
+    arts  = [a for a in state["articles"] if a["date"] == today_str]
+    grab  = [a for a in arts if a["bucket"]=="grab"]
+    comp  = [a for a in arts if a["bucket"]=="comp"]
+    ind   = [a for a in arts if a["bucket"]=="ind"]
     lines = [
         f"📋 *The Grab Daily — {today_label}*",
-        f"_Subject: The Grab Daily \\- Daily Monitoring {today_label}_\n",
+        f"Subject: The Grab Daily - Daily Monitoring {today_label}\n",
         "Hi all,\n\nPlease find today's Grab Daily report below:\n",
     ]
     if grab:
         lines.append("*Grab*")
-        for a in grab:
-            lines.append(f"• [{a['headline']}]({a['url']}) _{a['pub']}_")
+        for a in grab: lines.append(f"• [{a['headline']}]({a['url']}) _{a['pub']}_")
         lines.append("")
     if comp:
         lines.append("*Competitor News*")
-        for a in comp:
-            lines.append(f"• [{a['headline']}]({a['url']}) _{a['pub']}_")
+        for a in comp: lines.append(f"• [{a['headline']}]({a['url']}) _{a['pub']}_")
         lines.append("")
     if ind:
         lines.append("*Industry News*")
-        for a in ind:
-            lines.append(f"• [{a['headline']}]({a['url']}) _{a['pub']}_")
+        for a in ind: lines.append(f"• [{a['headline']}]({a['url']}) _{a['pub']}_")
         lines.append("")
     if not grab and not comp and not ind:
-        lines.append("_No articles fetched yet today\\. Run /all first\\._")
+        lines.append("_No articles fetched yet today. Run /all first._")
     return "\n".join(lines)
 
-def fmt_watchlist():
-    now = datetime.now(SGT)
-    active = [w for w in state["watchlist"] if datetime.fromisoformat(w["due"]) >= now]
-    if not active:
-        return "📋 *Watchlist*\nNo active items\\."
-    lines = ["📋 *Watchlist — active items*\n"]
-    for w in active:
-        due  = datetime.fromisoformat(w["due"])
-        days = (due - now).days
-        matched = any(
-            w["keyword"].lower().split()[0] in a["headline"].lower()
-            for a in state["articles"]
-        )
-        status = "✅ Matched" if matched else f"👁 Watching \\({days}d left\\)"
-        lines.append(f"*{w['keyword']}* — {status}")
-        if w.get("notes"):
-            lines.append(f"  _{w['notes']}_")
-    return "\n".join(lines)
-
-# ── Command handlers ──────────────────────────────────────────────────────────
+# ── Commands ──────────────────────────────────────────────────────────────────
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Grab Daily Bot*\n\n"
@@ -270,11 +205,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/all — fetch all three buckets now\n"
         "/report — draft today's Grab Daily report\n"
         "/watchlist — show active watchlist\n"
-        "/watch keyword \\| notes \\| days — add watchlist item\n"
-        "  e\\.g\\. `/watch Grab AV Punggol | Expected follow-up | 7`\n\n"
-        "⏰ *Auto\\-schedule \\(SGT\\):* 8am, 10am, 12pm, 3pm, 5pm, 7pm\n"
-        "📋 *Report draft:* sent to group at 12pm daily",
-        parse_mode=ParseMode.MARKDOWN_V2
+        "/watch keyword | notes | days — add watchlist item\n"
+        "  e.g. /watch Grab AV Punggol | Expected follow-up | 7\n\n"
+        "Auto-sweeps: 8am 10am 12pm 3pm 5pm 7pm SGT\n"
+        "Report draft: sent to group at 12pm daily",
+        parse_mode=ParseMode.MARKDOWN
     )
 
 async def cmd_grab(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -301,7 +236,7 @@ async def cmd_industry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Fetching all buckets...")
-    new, urgent = await fetch_all_buckets()
+    new, urgent = await fetch_all()
     grab_n = sum(1 for a in new if a["bucket"]=="grab")
     comp_n = sum(1 for a in new if a["bucket"]=="comp")
     ind_n  = sum(1 for a in new if a["bucket"]=="ind")
@@ -324,42 +259,47 @@ async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(fmt_watchlist(), parse_mode=ParseMode.MARKDOWN_V2)
+    now    = datetime.now(SGT)
+    active = [w for w in state["watchlist"] if datetime.fromisoformat(w["due"]) >= now]
+    if not active:
+        await update.message.reply_text("📋 *Watchlist*\nNo active items.", parse_mode=ParseMode.MARKDOWN)
+        return
+    lines = ["📋 *Watchlist — active items*\n"]
+    for w in active:
+        due     = datetime.fromisoformat(w["due"])
+        days    = (due - now).days
+        matched = any(w["keyword"].lower().split()[0] in a["headline"].lower() for a in state["articles"])
+        status  = "✅ Matched" if matched else f"👁 Watching ({days}d left)"
+        lines.append(f"*{w['keyword']}* — {status}")
+        if w.get("notes"): lines.append(f"  _{w['notes']}_")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.replace("/watch", "").strip()
+    text  = update.message.text.replace("/watch","").strip()
     parts = [p.strip() for p in text.split("|")]
     if not parts or not parts[0]:
-        await update.message.reply_text(
-            "Usage: /watch keyword | notes | days\n"
-            "Example: /watch Grab AV Punggol | Expected follow-up | 7"
-        )
+        await update.message.reply_text("Usage: /watch keyword | notes | days\nExample: /watch Grab AV Punggol | Expected follow-up | 7")
         return
     keyword = parts[0]
     notes   = parts[1] if len(parts) > 1 else ""
     days    = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 7
-    due = (datetime.now(SGT) + timedelta(days=days)).isoformat()
+    due     = (datetime.now(SGT) + timedelta(days=days)).isoformat()
     state["watchlist"].append({"keyword": keyword, "notes": notes, "due": due})
     save_state(state)
     due_label = (datetime.now(SGT) + timedelta(days=days)).strftime("%-d %b")
-    await update.message.reply_text(
-        f"✅ Watching: *{keyword}*\nUntil: {due_label}",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"✅ Watching: *{keyword}*\nUntil: {due_label}", parse_mode=ParseMode.MARKDOWN)
 
-# ── Scheduler (built into PTB job queue) ─────────────────────────────────────
+# ── Scheduled jobs ────────────────────────────────────────────────────────────
 async def job_sweep(ctx: ContextTypes.DEFAULT_TYPE):
-    log.info("Running scheduled sweep...")
-    new, urgent = await fetch_all_buckets()
-    if not new and not urgent:
-        return
+    log.info("Scheduled sweep running...")
+    new, urgent = await fetch_all()
+    if not new and not urgent: return
     grab_n = sum(1 for a in new if a["bucket"]=="grab")
     comp_n = sum(1 for a in new if a["bucket"]=="comp")
     ind_n  = sum(1 for a in new if a["bucket"]=="ind")
     now_str = datetime.now(SGT).strftime("%H:%M")
     await ctx.bot.send_message(GROUP_CHAT_ID,
-        f"⏰ *{now_str} sweep*\n"
-        f"🟢 Grab: {grab_n}  🟠 Comp: {comp_n}  🔵 Industry: {ind_n} new articles",
+        f"⏰ *{now_str} sweep*\n🟢 Grab: {grab_n}  🟠 Comp: {comp_n}  🔵 Industry: {ind_n} new",
         parse_mode=ParseMode.MARKDOWN)
     for a in new[:10]:
         urg = "🚨 " if a["urgent"] else ""
@@ -375,15 +315,14 @@ async def job_report(ctx: ContextTypes.DEFAULT_TYPE):
     log.info("Sending 12pm report...")
     await ctx.bot.send_message(GROUP_CHAT_ID, fmt_report(),
         parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    today_str = datetime.now(SGT).strftime("%Y-%m-%d")
     matched = [w for w in state["watchlist"]
                if any(w["keyword"].lower().split()[0] in a["headline"].lower()
-                      for a in state["articles"]
-                      if a["date"] == datetime.now(SGT).strftime("%Y-%m-%d"))]
+                      for a in state["articles"] if a["date"] == today_str)]
     if matched:
         kws = ", ".join(w["keyword"] for w in matched)
         await ctx.bot.send_message(GROUP_CHAT_ID,
-            f"👁 *Watchlist matches today:* {kws}",
-            parse_mode=ParseMode.MARKDOWN)
+            f"👁 *Watchlist matches today:* {kws}", parse_mode=ParseMode.MARKDOWN)
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
@@ -399,20 +338,13 @@ def main():
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CommandHandler("watch",     cmd_watch))
 
-    # Use PTB's built-in job queue instead of APScheduler — avoids the crash
+    # Schedules in SGT (UTC+8)
     jq = app.job_queue
-    sgt_offset = 8 * 3600  # SGT = UTC+8
-
-    # Sweeps at 8am, 10am, 12pm, 3pm, 5pm, 7pm SGT
     for hour in [8, 10, 12, 15, 17, 19]:
-        jq.run_daily(job_sweep, time=datetime.now(SGT).replace(
-            hour=hour, minute=0, second=0, microsecond=0).timetz())
+        jq.run_daily(job_sweep, time=time(hour=hour, minute=0, tzinfo=SGT))
+    jq.run_daily(job_report, time=time(hour=12, minute=1, tzinfo=SGT))
 
-    # Report at 12:01pm SGT
-    jq.run_daily(job_report, time=datetime.now(SGT).replace(
-        hour=12, minute=1, second=0, microsecond=0).timetz())
-
-    log.info("Bot started. Scheduler running.")
+    log.info("Bot started. Polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
