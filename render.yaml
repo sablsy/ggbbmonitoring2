@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: grab-daily-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: GROUP_CHAT_ID
+        sync: false
+      - key: PERPLEXITY_KEY
+        sync: false
