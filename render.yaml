@@ -1,7 +1,11 @@
+# Render Blueprint — optional one-click deploy from the Render dashboard.
+# After connecting this repo, set TELEGRAM_TOKEN and GROUP_CHAT_ID in the dashboard.
+
 services:
   - type: worker
     name: grab-daily-bot
-    env: python
+    runtime: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
@@ -11,3 +15,4 @@ services:
         sync: false
       - key: PERPLEXITY_KEY
         sync: false
+        optional: true
